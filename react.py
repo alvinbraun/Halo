@@ -54,6 +54,7 @@ async def process_reaction_list(client: Client, message: Message):
         )
         
         # 4. Ekstrak data username
+        # 4. Ekstrak data username / display name
         if hasattr(raw_reply, "users"):
             for raw_user in raw_reply.users:
                 username = None
@@ -64,9 +65,15 @@ async def process_reaction_list(client: Client, message: Message):
                         if getattr(u, "active", False) or getattr(u, "editable", False):
                             username = u.username
                             break
-                
+
                 if username:
                     user_list.append(f"@{username}")
+                else:
+                    first = getattr(raw_user, "first_name", "") or ""
+                    last = getattr(raw_user, "last_name", "") or ""
+                    dn = f"{first} {last}".strip().replace("`", "")
+                    if dn:
+                        user_list.append(f"{dn} (no usn)")
 
     except Exception as e:
         print(f"Error: {str(e)}")
