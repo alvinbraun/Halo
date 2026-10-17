@@ -124,7 +124,7 @@ async def cmd_doni(client: Client, message: Message):
 
 # ==================== [TAMBAHAN] AUTO-BAN SAAT LEFT CHANNEL & /unbin ====================
 # Syarat: akun userbot ini harus ADMIN di channel dengan izin "Ban users".
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003870610445"))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003882339899"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "10"))      # jeda cek admin log (detik)
 BACKFILL = os.environ.get("BACKFILL", "1") == "1"                  # 1 = saat start, ban juga yang left 48 jam terakhir
 EXEMPT_IDS = {int(x) for x in os.environ.get("EXEMPT_IDS", "").split(",") if x.strip()}
