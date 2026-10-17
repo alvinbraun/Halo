@@ -4,6 +4,11 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.raw import functions
 from pyrogram.raw.types import InputPeerChannel, InputPeerChat
+# [TAMBAHAN] import untuk auto-ban & /unbin
+import re
+from pyrogram import idle
+from pyrogram.errors import FloodWait
+from pyrogram.raw import types as raw_types
 
 # ==================== CONFIGURATION (SECURED) ====================
 # Mengambil data dari Environment Variables yang diset di Railway
@@ -117,5 +122,183 @@ async def cmd_doni(client: Client, message: Message):
     await message.reply_text(text=caption_template, disable_web_page_preview=False)
 
 
+# ==================== [TAMBAHAN] AUTO-BAN SAAT LEFT CHANNEL & /unbin ====================
+# Syarat: akun userbot ini harus ADMIN di channel dengan izin "Ban users".
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003870610445"))
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "10"))      # jeda cek admin log (detik)
+BACKFILL = os.environ.get("BACKFILL", "1") == "1"                  # 1 = saat start, ban juga yang left 48 jam terakhir
+EXEMPT_IDS = {int(x) for x in os.environ.get("EXEMPT_IDS", "").split(",") if x.strip()}
+# Selain akun ini sendiri, siapa lagi yang boleh pakai /unbin (user id, pisah koma). Kosong = hanya akun ini.
+UNBIN_ADMIN_IDS = [int(x) for x in os.environ.get("UNBIN_ADMIN_IDS", "").split(",") if x.strip()]
+
+USERNAME_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{3,31})")
+
+
+async def get_channel_input(client: Client):
+    peer = await client.resolve_peer(CHANNEL_ID)
+    return raw_types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
+
+
+async def set_ban(client: Client, channel, input_peer, banned: bool):
+    """banned=True -> ban dari channel, banned=False -> unban."""
+    if banned:
+        rights = raw_types.ChatBannedRights(until_date=0, view_messages=True)
+    else:
+        rights = raw_types.ChatBannedRights(until_date=0)
+    await client.invoke(
+        functions.channels.EditBanned(channel=channel, participant=input_peer, banned_rights=rights)
+    )
+
+
+async def ban_with_retry(client: Client, channel, user):
+    peer = raw_types.InputPeerUser(user_id=user.id, access_hash=user.access_hash)
+    for _ in range(3):
+        try:
+            await set_ban(client, channel, peer, True)
+            return True
+        except FloodWait as e:
+            wait = getattr(e, "value", None) or getattr(e, "x", 10)
+            print(f"[autoban] FloodWait {wait}s saat ban {user.id}, nunggu")
+            await asyncio.sleep(wait + 2)
+        except Exception as e:
+            print(f"[autoban] Gagal ban {user.id}: {type(e).__name__}: {e}")
+            return False
+    return False
+
+
+async def fetch_leave_events(client: Client, channel, min_id: int):
+    """Ambil semua event 'left' di admin log dengan id > min_id. Return (events, users_by_id)."""
+    events, users, seen = [], {}, set()
+    max_id = 0
+    while True:
+        res = await client.invoke(
+            functions.channels.GetAdminLog(
+                channel=channel,
+                q="",
+                max_id=max_id,
+                min_id=min_id,
+                limit=100,
+                events_filter=raw_types.ChannelAdminLogEventsFilter(leave=True),
+            )
+        )
+        for u in res.users:
+            users[u.id] = u
+        new = [e for e in res.events if e.id not in seen]
+        for e in new:
+            seen.add(e.id)
+        events.extend(new)
+        if len(res.events) < 100 or not new:
+            break
+        max_id = min(e.id for e in res.events)
+    return events, users
+
+
+async def autoban_loop(client: Client):
+    """Cek 'Recent actions' channel, ban setiap orang yang left."""
+    try:
+        async for _ in client.get_dialogs():  # isi cache peer supaya channel bisa ditemukan
+            pass
+        channel = await get_channel_input(client)
+        first = await client.invoke(
+            functions.channels.GetAdminLog(channel=channel, q="", max_id=0, min_id=0, limit=1)
+        )
+    except Exception as e:
+        print(f"[autoban] Tidak bisa baca admin log (akun harus admin channel {CHANNEL_ID}): {type(e).__name__}: {e}")
+        return
+
+    last = 0
+    if not BACKFILL and first.events:
+        last = first.events[0].id
+
+    me = await client.get_me()
+    done = set()
+    print(f"[autoban] Memantau {CHANNEL_ID} tiap {POLL_INTERVAL:.0f} detik (backfill={'ya' if BACKFILL else 'tidak'})")
+
+    while True:
+        try:
+            events, users = await fetch_leave_events(client, channel, last)
+            for ev in sorted(events, key=lambda e: e.id):
+                uid = ev.user_id
+                u = users.get(uid)
+                skip = uid in done or uid == me.id or uid in EXEMPT_IDS or getattr(u, "bot", False)
+                if not skip:
+                    if u is None or not getattr(u, "access_hash", None):
+                        print(f"[autoban] Data user {uid} tidak ada di admin log, dilewati")
+                    elif await ban_with_retry(client, channel, u):
+                        done.add(uid)
+                        print(f"[autoban] 🚫 Ban {uid} (left channel)")
+                last = max(last, ev.id)
+        except FloodWait as e:
+            wait = getattr(e, "value", None) or getattr(e, "x", 10)
+            print(f"[autoban] FloodWait {wait}s saat baca admin log")
+            await asyncio.sleep(wait + 5)
+        except Exception as e:
+            print(f"[autoban] Error baca admin log: {type(e).__name__}: {e}")
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+@app.on_message(filters.command("unbin", prefixes=["/", "."]) & (filters.me | filters.user(UNBIN_ADMIN_IDS)))
+async def cmd_unbin(client: Client, message: Message):
+    """Unban dari channel.
+    - /unbin @username  (bisa lebih dari satu)
+    - reply pesan yang berisi @username dengan /unbin
+    - reply pesan seseorang (tanpa @username di teksnya) dengan /unbin -> orang itu yang di-unban"""
+    me = await client.get_me()
+    refs = [a.lstrip("@") for a in message.command[1:]]
+
+    r = message.reply_to_message
+    if not refs and r:
+        text = r.text or r.caption or ""
+        refs += USERNAME_RE.findall(text)
+        for ent in (r.entities or []) + (r.caption_entities or []):
+            if getattr(ent, "user", None):
+                refs.append(ent.user.id)
+        if not refs and r.from_user and not r.from_user.is_self:
+            refs.append(r.from_user.id)
+
+    # buang duplikat dan akun userbot sendiri
+    cleaned, seen = [], set()
+    for ref in refs:
+        key = str(ref).lower()
+        if key in seen or key == str(me.id) or (me.username and key == me.username.lower()):
+            continue
+        seen.add(key)
+        cleaned.append(ref)
+
+    if not cleaned:
+        return
+
+    try:
+        channel = await get_channel_input(client)
+    except Exception as e:
+        await message.reply_text(f"❌ Channel tidak ditemukan: {type(e).__name__}")
+        return
+
+    ok, fail = [], []
+    for ref in cleaned:
+        try:
+            key = int(ref) if str(ref).lstrip("-").isdigit() else ref
+            user = await client.get_users(key)
+            peer = await client.resolve_peer(user.id)
+            await set_ban(client, channel, peer, False)
+            ok.append(f"@{user.username}" if user.username else str(user.id))
+        except Exception as e:
+            fail.append(f"{ref} ({type(e).__name__})")
+
+    # satu baris per orang: "@username unbanned"
+    lines = [f"{x} unbanned" for x in ok]
+    if fail:
+        lines.append("gagal: " + ", ".join(fail))
+    await message.reply_text("\n".join(lines))
+
+
+async def main():
+    await app.start()
+    task = asyncio.create_task(autoban_loop(app))
+    await idle()
+    task.cancel()
+    await app.stop()
+
+
 print("⚡ Userbot /done & /doni v10 Aktif dengan Sistem Keamanan Variabel!")
-app.run()
+app.run(main())
